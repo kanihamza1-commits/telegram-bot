@@ -9,25 +9,55 @@ from telegram.ext import (
 )
 
 # ========================================
-# ⚙️ الإعدادات — غيّر هذه القيم فقط
+# ⚙️ SETTINGS
 # ========================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع-توكن-البوت-هنا")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "ضع-رقم-حسابك-هنا"))  # رقم ID الخاص بك في تيليغرام
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
+
+BOOKS_LINK = "https://drive.google.com/drive/folders/1Dpr_Vjmf4cAGiEcsxZdp-HhX7tL8LZgJ?usp=drive_link"
+
+WELCOME_MESSAGE = """❗️Please read the following carefully so we can work together effectively.❗️
+
+🧾 I have received your payment — thank you!
+
+Welcome to our Premium Trading Community! From now on, all trade analyses will be shared privately between us.
+
+✅ You will receive detailed 1D, 4H, and 1H trade updates.
+✅ Feel free to ask me any questions at any time.
+✅ There is always enough time to enter trades, so no need to rush or panic.
+
+Looking forward to working with you! 🚀"""
+
+BOOKS_MESSAGE = """📚 *Recommended Reading*
+
+To support your learning, I have compiled a collection of books that will help you gain a deeper and clearer understanding of Elliott Wave Theory.
+
+I have uploaded them to Google Drive and recently added new books to the collection.
+
+📥 You can download them here:
+{}""".format(BOOKS_LINK)
+
+RISK_MESSAGE = """⚠️ *Risk Management Guide*
+
+This is extremely important — please read it carefully before placing any trade."""
 
 # ========================================
-# 🗄️ قاعدة البيانات
+# 🗄️ DATABASE
 # ========================================
 def init_db():
     conn = sqlite3.connect("subscribers.db")
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            full_name   TEXT,
-            joined_at   TEXT,
-            expiry_date TEXT,
-            is_active   INTEGER DEFAULT 1
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            full_name     TEXT,
+            email         TEXT,
+            membership    TEXT,
+            joined_at     TEXT,
+            expiry_date   TEXT,
+            is_active     INTEGER DEFAULT 1,
+            step          TEXT DEFAULT 'done'
         )
     """)
     conn.commit()
@@ -36,31 +66,44 @@ def init_db():
 def get_conn():
     return sqlite3.connect("subscribers.db")
 
-def add_user(user_id, username, full_name):
+def upsert_user(user_id, username, full_name):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT OR IGNORE INTO users (user_id, username, full_name, joined_at, expiry_date, is_active)
-        VALUES (?, ?, ?, ?, ?, 1)
-    """, (user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M"), None))
+        INSERT OR IGNORE INTO users (user_id, username, full_name, joined_at, step)
+        VALUES (?, ?, ?, ?, 'ask_email')
+    """, (user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     conn.close()
 
-def get_all_active_users():
+def get_user(user_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE is_active = 1")
-    rows = c.fetchall()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
     conn.close()
-    return [r[0] for r in rows]
+    return row
 
-def get_all_users():
+def set_step(user_id, step):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT user_id, username, full_name, joined_at, expiry_date, is_active FROM users")
-    rows = c.fetchall()
+    c.execute("UPDATE users SET step = ? WHERE user_id = ?", (step, user_id))
+    conn.commit()
     conn.close()
-    return rows
+
+def set_email(user_id, email):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET email = ?, step = 'ask_membership' WHERE user_id = ?", (email, user_id))
+    conn.commit()
+    conn.close()
+
+def set_membership(user_id, membership):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET membership = ?, step = 'done', is_active = 1 WHERE user_id = ?", (membership, user_id))
+    conn.commit()
+    conn.close()
 
 def set_expiry(user_id, days):
     expiry = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
@@ -78,12 +121,21 @@ def deactivate_user(user_id):
     conn.commit()
     conn.close()
 
-def activate_user(user_id):
+def get_all_active_users():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    c.execute("SELECT user_id FROM users WHERE is_active = 1")
+    rows = c.fetchall()
     conn.close()
+    return [r[0] for r in rows]
+
+def get_all_users():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, full_name, email, membership, joined_at, expiry_date, is_active FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 def get_expiring_users():
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -94,7 +146,7 @@ def get_expiring_users():
     conn.close()
     return rows
 
-def count_users():
+def count_active():
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
@@ -103,254 +155,377 @@ def count_users():
     return total
 
 # ========================================
-# 🤖 أوامر المستخدمين
+# 🤖 USER COMMANDS
 # ========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    add_user(user.id, user.username or "", user.full_name or "")
+    existing = get_user(user.id)
 
-    text = (
-        f"👋 مرحباً {user.first_name}!\n\n"
-        "شكراً على اشتراكك في خدمتنا.\n"
-        "ستصلك التحديثات والتحليلات مباشرة هنا.\n\n"
-        "📌 الأوامر المتاحة:\n"
-        "/status — معرفة حالة اشتراكك\n"
-        "/help — المساعدة"
-    )
-    await update.message.reply_text(text)
+    if existing and existing[8] == 'done':
+        await update.message.reply_text(
+            f"👋 Welcome back, {user.first_name}!\n\n"
+            "You're already registered. Use /status to check your membership."
+        )
+        return
 
-    # إشعار الأدمن
-    await context.bot.send_message(
-        ADMIN_ID,
-        f"🔔 مشترك جديد!\n"
-        f"الاسم: {user.full_name}\n"
-        f"يوزرنيم: @{user.username or 'لا يوجد'}\n"
-        f"ID: {user.id}\n"
-        f"إجمالي المشتركين: {count_users()}"
+    upsert_user(user.id, user.username or "", user.full_name or "")
+
+    await update.message.reply_text(
+        f"👋 Hello! Welcome to *Wave Kani Premium Trading* 📊\n\n"
+        "I'm glad to have you here!\n\n"
+        "📧 To get started, please share your *email address*:",
+        parse_mode="Markdown"
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT is_active, expiry_date FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+    user = get_user(user_id)
 
-    if not row:
-        await update.message.reply_text("❌ لست مسجلاً، اكتب /start أولاً.")
+    if not user:
+        await update.message.reply_text("❌ You're not registered yet. Please type /start")
         return
 
-    is_active, expiry = row
+    is_active = user[7]
+    expiry = user[6]
+    membership = user[4] or "Not set"
+
     if is_active:
-        exp_text = f"📅 تنتهي في: {expiry}" if expiry else "✅ عضوية دائمة"
-        await update.message.reply_text(f"✅ اشتراكك نشط\n{exp_text}")
+        exp_text = f"📅 Expires on: {expiry}" if expiry else "✅ Lifetime membership"
+        await update.message.reply_text(
+            f"✅ Your subscription is *active*\n"
+            f"📋 Plan: {membership}\n"
+            f"{exp_text}",
+            parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text("❌ اشتراكك غير نشط، تواصل مع الأدمن.")
+        await update.message.reply_text(
+            "❌ Your subscription is not active.\n"
+            "Please contact the admin to renew."
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 الأوامر:\n"
-        "/start — تسجيل الاشتراك\n"
-        "/status — حالة الاشتراك\n\n"
-        "للتواصل مع الأدمن: /contact"
+        "📋 *Available Commands:*\n\n"
+        "/start — Register your account\n"
+        "/status — Check your membership status\n"
+        "/contact — Send a message to the admin",
+        parse_mode="Markdown"
     )
 
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not context.args:
-        await update.message.reply_text("✏️ اكتب رسالتك بعد الأمر:\n/contact رسالتك هنا")
+        await update.message.reply_text("✏️ Write your message after the command:\n/contact your message here")
         return
     msg = " ".join(context.args)
     await context.bot.send_message(
         ADMIN_ID,
-        f"📩 رسالة من مشترك:\n"
-        f"الاسم: {user.full_name}\n"
-        f"ID: {user.id}\n"
-        f"@{user.username or 'لا يوجد'}\n\n"
-        f"الرسالة: {msg}"
+        f"📩 *Message from subscriber:*\n"
+        f"Name: {user.full_name}\n"
+        f"ID: `{user.id}`\n"
+        f"@{user.username or 'no username'}\n\n"
+        f"Message: {msg}",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text("✅ تم إرسال رسالتك للأدمن.")
+    await update.message.reply_text("✅ Your message has been sent to the admin.")
 
 # ========================================
-# 👑 لوحة تحكم الأدمن
+# 👑 ADMIN PANEL
 # ========================================
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("❌ هذا الأمر للأدمن فقط.")
-            return
-        return await func(update, context)
-    return wrapper
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
-@admin_only
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = count_users()
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    total = count_active()
     keyboard = [
-        [InlineKeyboardButton("📢 بث رسالة للكل", callback_data="broadcast")],
-        [InlineKeyboardButton("👥 قائمة المشتركين", callback_data="list_users")],
-        [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
-        [InlineKeyboardButton("➕ تجديد عضوية", callback_data="set_expiry")],
-        [InlineKeyboardButton("🚫 إلغاء عضوية", callback_data="deactivate")],
+        [InlineKeyboardButton("📢 Broadcast to All", callback_data="broadcast")],
+        [InlineKeyboardButton("👥 Subscribers List", callback_data="list_users")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+        [InlineKeyboardButton("➕ Renew Membership", callback_data="set_expiry")],
+        [InlineKeyboardButton("🚫 Deactivate Member", callback_data="deactivate")],
     ]
     await update.message.reply_text(
-        f"👑 لوحة التحكم\n👥 المشتركين النشطين: {total}",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"👑 *Admin Panel*\n👥 Active subscribers: {total}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
 
     data = query.data
 
     if data == "stats":
         users = get_all_users()
-        active = sum(1 for u in users if u[5] == 1)
+        active = sum(1 for u in users if u[7] == 1)
         inactive = len(users) - active
         await query.edit_message_text(
-            f"📊 الإحصائيات:\n"
-            f"إجمالي المشتركين: {len(users)}\n"
-            f"النشطين: {active}\n"
-            f"غير النشطين: {inactive}"
+            f"📊 *Statistics:*\n\n"
+            f"Total subscribers: {len(users)}\n"
+            f"Active: {active}\n"
+            f"Inactive: {inactive}",
+            parse_mode="Markdown"
         )
 
     elif data == "broadcast":
         context.user_data["action"] = "broadcast"
-        await query.edit_message_text("📢 أرسل الرسالة التي تريد بثها للجميع:")
+        await query.edit_message_text("📢 Send the message you want to broadcast to all subscribers:")
 
     elif data == "list_users":
         users = get_all_users()
         if not users:
-            await query.edit_message_text("لا يوجد مشتركين بعد.")
+            await query.edit_message_text("No subscribers yet.")
             return
-        text = "👥 قائمة المشتركين:\n\n"
-        for u in users[:20]:  # أول 20 فقط
-            status_icon = "✅" if u[5] == 1 else "❌"
-            text += f"{status_icon} {u[2]} | ID: {u[0]} | ينتهي: {u[4] or 'دائم'}\n"
+        text = "👥 *Subscribers List:*\n\n"
+        for u in users[:20]:
+            icon = "✅" if u[7] == 1 else "❌"
+            text += f"{icon} {u[2]} | `{u[0]}` | {u[4] or 'N/A'} | Exp: {u[6] or 'Lifetime'}\n"
         if len(users) > 20:
-            text += f"\n... و{len(users)-20} آخرين"
-        await query.edit_message_text(text)
+            text += f"\n...and {len(users)-20} more"
+        await query.edit_message_text(text, parse_mode="Markdown")
 
     elif data == "set_expiry":
         context.user_data["action"] = "set_expiry"
         await query.edit_message_text(
-            "➕ لتجديد عضوية، أرسل:\n"
-            "ID_المستخدم عدد_الأيام\n\n"
-            "مثال: 123456789 30"
+            "➕ To renew a membership, send:\n"
+            "`USER_ID NUMBER_OF_DAYS`\n\n"
+            "Example: `123456789 30`",
+            parse_mode="Markdown"
         )
 
     elif data == "deactivate":
         context.user_data["action"] = "deactivate"
-        await query.edit_message_text(
-            "🚫 لإلغاء عضوية، أرسل ID المستخدم:"
-        )
+        await query.edit_message_text("🚫 Send the user ID to deactivate:")
 
-@admin_only
+    # Membership selection buttons
+    elif data.startswith("membership_"):
+        plan = data.replace("membership_", "")
+        user_id = context.user_data.get("pending_membership_user")
+        if user_id:
+            set_membership(user_id, plan)
+            context.user_data.pop("pending_membership_user", None)
+            await query.edit_message_text(f"✅ Membership set to: *{plan}*", parse_mode="Markdown")
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"✅ Your membership plan has been set: *{plan}*\n\nWelcome aboard! 🚀",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     if not context.args:
-        await update.message.reply_text("استخدام: /broadcast رسالتك هنا")
+        await update.message.reply_text("Usage: /broadcast your message here")
         return
     msg = " ".join(context.args)
     users = get_all_active_users()
     success, failed = 0, 0
     for uid in users:
         try:
-            await context.bot.send_message(uid, f"📢 تحديث جديد:\n\n{msg}")
+            await context.bot.send_message(uid, f"📢 *New Update:*\n\n{msg}", parse_mode="Markdown")
             success += 1
         except:
             failed += 1
-    await update.message.reply_text(
-        f"✅ تم الإرسال!\nنجح: {success} | فشل: {failed}"
-    )
+    await update.message.reply_text(f"✅ Broadcast done!\nSuccess: {success} | Failed: {failed}")
 
-@admin_only
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """رد خاص على مشترك: /reply ID رسالة"""
+    if not is_admin(update.effective_user.id):
+        return
     if len(context.args) < 2:
-        await update.message.reply_text("استخدام: /reply ID_المستخدم رسالتك")
+        await update.message.reply_text("Usage: /reply USER_ID your message")
         return
     target_id = context.args[0]
     msg = " ".join(context.args[1:])
     try:
-        await context.bot.send_message(int(target_id), f"💬 رسالة خاصة من الأدمن:\n\n{msg}")
-        await update.message.reply_text("✅ تم الإرسال بنجاح.")
+        await context.bot.send_message(int(target_id), f"💬 *Private message from admin:*\n\n{msg}", parse_mode="Markdown")
+        await update.message.reply_text("✅ Message sent successfully.")
     except Exception as e:
-        await update.message.reply_text(f"❌ فشل الإرسال: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
 
-@admin_only
-async def set_expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تجديد عضوية: /setexpiry ID أيام"""
+async def setexpiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     if len(context.args) < 2:
-        await update.message.reply_text("استخدام: /setexpiry ID_المستخدم عدد_الأيام")
+        await update.message.reply_text("Usage: /setexpiry USER_ID DAYS")
         return
     user_id = int(context.args[0])
     days = int(context.args[1])
     expiry = set_expiry(user_id, days)
-    await update.message.reply_text(f"✅ تم تجديد العضوية حتى: {expiry}")
+    await update.message.reply_text(f"✅ Membership renewed until: {expiry}")
     try:
-        await context.bot.send_message(
-            user_id,
-            f"🎉 تم تجديد اشتراكك!\nينتهي في: {expiry}"
-        )
+        await context.bot.send_message(user_id, f"🎉 Your subscription has been renewed!\nExpires on: *{expiry}*", parse_mode="Markdown")
     except:
         pass
 
-@admin_only
 async def deactivate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء عضوية: /deactivate ID"""
+    if not is_admin(update.effective_user.id):
+        return
     if not context.args:
-        await update.message.reply_text("استخدام: /deactivate ID_المستخدم")
+        await update.message.reply_text("Usage: /deactivate USER_ID")
         return
     user_id = int(context.args[0])
     deactivate_user(user_id)
-    await update.message.reply_text(f"✅ تم إلغاء عضوية المستخدم {user_id}.")
+    await update.message.reply_text(f"✅ User {user_id} has been deactivated.")
     try:
-        await context.bot.send_message(user_id, "❌ تم إلغاء اشتراكك. تواصل مع الأدمن.")
+        await context.bot.send_message(user_id, "❌ Your subscription has been deactivated. Please contact the admin.")
     except:
         pass
 
-# معالجة الرسائل النصية للأدمن
+# ========================================
+# 💬 MESSAGE HANDLER (registration flow + admin actions)
+# ========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    # ADMIN actions
+    if is_admin(user.id):
+        action = context.user_data.get("action")
+
+        if action == "broadcast":
+            users = get_all_active_users()
+            success, failed = 0, 0
+            for uid in users:
+                try:
+                    await context.bot.send_message(uid, f"📢 *New Update:*\n\n{text}", parse_mode="Markdown")
+                    success += 1
+                except:
+                    failed += 1
+            context.user_data.pop("action", None)
+            await update.message.reply_text(f"✅ Broadcast done!\nSuccess: {success} | Failed: {failed}")
+            return
+
+        elif action == "set_expiry":
+            parts = text.split()
+            if len(parts) == 2:
+                uid, days = int(parts[0]), int(parts[1])
+                expiry = set_expiry(uid, days)
+                context.user_data.pop("action", None)
+                await update.message.reply_text(f"✅ Membership renewed until: {expiry}")
+                try:
+                    await context.bot.send_message(uid, f"🎉 Your subscription has been renewed!\nExpires on: *{expiry}*", parse_mode="Markdown")
+                except:
+                    pass
+            else:
+                await update.message.reply_text("❌ Wrong format. Send: USER_ID DAYS")
+            return
+
+        elif action == "deactivate":
+            uid = int(text.strip())
+            deactivate_user(uid)
+            context.user_data.pop("action", None)
+            await update.message.reply_text(f"✅ User {uid} deactivated.")
+            return
+
+    # USER registration flow
+    db_user = get_user(user.id)
+    if not db_user:
+        await update.message.reply_text("Please type /start to register.")
         return
 
-    action = context.user_data.get("action")
+    step = db_user[8]
 
-    if action == "broadcast":
-        msg = update.message.text
-        users = get_all_active_users()
-        success, failed = 0, 0
-        for uid in users:
-            try:
-                await context.bot.send_message(uid, f"📢 تحديث جديد:\n\n{msg}")
-                success += 1
-            except:
-                failed += 1
-        context.user_data.pop("action", None)
-        await update.message.reply_text(f"✅ تم البث!\nنجح: {success} | فشل: {failed}")
+    if step == "ask_email":
+        # Save email
+        set_email(user.id, text)
 
-    elif action == "set_expiry":
-        parts = update.message.text.split()
-        if len(parts) == 2:
-            user_id, days = int(parts[0]), int(parts[1])
-            expiry = set_expiry(user_id, days)
-            context.user_data.pop("action", None)
-            await update.message.reply_text(f"✅ تم تجديد العضوية حتى: {expiry}")
-        else:
-            await update.message.reply_text("❌ صيغة خاطئة. أرسل: ID عدد_الأيام")
+        # Ask membership type
+        keyboard = [
+            [InlineKeyboardButton("📅 1 Month", callback_data="membership_1 Month")],
+            [InlineKeyboardButton("📅 3 Months", callback_data="membership_3 Months")],
+            [InlineKeyboardButton("📅 1 Year", callback_data="membership_1 Year")],
+        ]
+        await update.message.reply_text(
+            "✅ Email saved!\n\n📋 What is your membership period?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-    elif action == "deactivate":
-        user_id = int(update.message.text.strip())
-        deactivate_user(user_id)
-        context.user_data.pop("action", None)
-        await update.message.reply_text(f"✅ تم إلغاء عضوية {user_id}.")
+    elif step == "ask_membership":
+        # fallback if they type instead of pressing button
+        set_membership(user.id, text)
+        await send_welcome_package(update, context, user.id)
+
+async def handle_membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if not data.startswith("membership_"):
+        return
+
+    # Check if this is admin setting membership for another user
+    if is_admin(query.from_user.id) and "pending_membership_user" in context.user_data:
+        plan = data.replace("membership_", "")
+        uid = context.user_data.pop("pending_membership_user")
+        set_membership(uid, plan)
+        await query.edit_message_text(f"✅ Membership set to: *{plan}*", parse_mode="Markdown")
+        try:
+            await context.bot.send_message(uid, f"✅ Your plan: *{plan}*\nWelcome! 🚀", parse_mode="Markdown")
+        except:
+            pass
+        return
+
+    # User selecting their own membership
+    plan = data.replace("membership_", "")
+    user_id = query.from_user.id
+    set_membership(user_id, plan)
+
+    await query.edit_message_text(
+        f"✅ *Membership period:* {plan}\n\nThank you! Sending your welcome package... 📦",
+        parse_mode="Markdown"
+    )
+
+    await send_welcome_package_by_id(context.bot, query.from_user, user_id)
+
+    # Notify admin
+    user = query.from_user
+    db_user = get_user(user_id)
+    email = db_user[3] if db_user else "N/A"
+    await context.bot.send_message(
+        ADMIN_ID,
+        f"🔔 *New Subscriber!*\n\n"
+        f"Name: {user.full_name}\n"
+        f"Username: @{user.username or 'none'}\n"
+        f"ID: `{user.id}`\n"
+        f"Email: {email}\n"
+        f"Plan: {plan}\n\n"
+        f"Total active: {count_active()}",
+        parse_mode="Markdown"
+    )
+
+async def send_welcome_package(update, context, user_id):
+    await update.message.reply_text(WELCOME_MESSAGE)
+    await update.message.reply_text(BOOKS_MESSAGE, parse_mode="Markdown")
+    await update.message.reply_text(RISK_MESSAGE, parse_mode="Markdown")
+    try:
+        with open("risk_management.pdf", "rb") as f:
+            await context.bot.send_document(user_id, f, filename="Wave_Kani_Risk_Management.pdf")
+    except:
+        pass
+
+async def send_welcome_package_by_id(bot, user, user_id):
+    await bot.send_message(user_id, WELCOME_MESSAGE)
+    await bot.send_message(user_id, BOOKS_MESSAGE, parse_mode="Markdown")
+    await bot.send_message(user_id, RISK_MESSAGE, parse_mode="Markdown")
+    try:
+        with open("risk_management.pdf", "rb") as f:
+            await bot.send_document(user_id, f, filename="Wave_Kani_Risk_Management.pdf")
+    except:
+        pass
 
 # ========================================
-# ⏰ مهمة يومية — فحص انتهاء العضويات
+# ⏰ DAILY EXPIRY CHECK
 # ========================================
 async def check_expiry(context: ContextTypes.DEFAULT_TYPE):
     expiring = get_expiring_users()
@@ -358,46 +533,49 @@ async def check_expiry(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 user_id,
-                f"⚠️ تنبيه: اشتراكك سينتهي غداً ({expiry})!\n"
-                "تواصل مع الأدمن للتجديد."
+                f"⚠️ *Reminder:* Your subscription expires tomorrow ({expiry})!\n"
+                "Please contact the admin to renew.",
+                parse_mode="Markdown"
             )
             await context.bot.send_message(
                 ADMIN_ID,
-                f"⚠️ عضوية تنتهي غداً:\n{full_name} | ID: {user_id}"
+                f"⚠️ Subscription expiring tomorrow:\n{full_name} | ID: `{user_id}`",
+                parse_mode="Markdown"
             )
         except:
             pass
 
 # ========================================
-# 🚀 تشغيل البوت
+# 🚀 MAIN
 # ========================================
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # أوامر المستخدمين
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("contact", contact))
 
-    # أوامر الأدمن
+    # Admin commands
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("reply", reply_cmd))
-    app.add_handler(CommandHandler("setexpiry", set_expiry_cmd))
+    app.add_handler(CommandHandler("setexpiry", setexpiry_cmd))
     app.add_handler(CommandHandler("deactivate", deactivate_cmd))
 
-    # الأزرار
+    # Callbacks — membership first, then general
+    app.add_handler(CallbackQueryHandler(handle_membership_callback, pattern="^membership_"))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # الرسائل النصية
+    # Text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # مهمة يومية الساعة 9 صباحاً
+    # Daily expiry check at 9AM
     app.job_queue.run_daily(check_expiry, time=datetime.strptime("09:00", "%H:%M").time())
 
-    print("✅ البوت يعمل...")
+    print("✅ Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
